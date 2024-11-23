@@ -1,1 +1,4 @@
 # グラフニューラルネットワーク
+
+## developer
+__olender
