@@ -1,5 +1,6 @@
 # グラフニューラルネットワーク
 
 ## developer
-__olender
-AkiraH4shimoto
+
+- __olender
+- AkiraH4shimoto
