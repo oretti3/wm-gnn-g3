@@ -49,7 +49,9 @@ class ParticleGNN(nn.Module):
             nn.Linear(embed_dim*2, embed_dim*2),
             nn.ReLU(),
             nn.Linear(embed_dim*2, 1),
-            nn.Sigmoid()
+            # nn.Sigmoid()
+            nn.Tanh(),
+            nn.ReLU()
         )
 
         self.gnn = GCNConv(
@@ -109,7 +111,12 @@ class ParticleGNN(nn.Module):
         cur_shape = key_value_input.shape
         key_value_input_reshape = key_value_input.view(B, key_value_N * key_value_T, C)  # (B, N*T, C)
         if self.last_shape is None or self.last_shape != cur_shape:
-            self.comb_indices = torch.combinations(torch.arange(key_value_N * key_value_T), 2)
+            # self.comb_indices = torch.combinations(torch.arange(key_value_N * key_value_T), 2)
+            # 組み合わせではなく、直積を利用
+            self.comb_indices = torch.cartesian_prod(
+                torch.arange(key_value_N * key_value_T),
+                torch.arange(key_value_N * key_value_T)
+            )
             # print("self.comb_indices", self.comb_indices)
             edge_list = []
             for b in range(B):
