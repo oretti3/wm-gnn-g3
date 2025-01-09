@@ -18,7 +18,7 @@ from stable_baselines3.common.policies import BaseModel
 
 from utils import batch_pairwise_dist
 
-from torch_geometric.nn import GATConv, GCNConv
+from torch_geometric.nn import GATConv, GCNConv, GINConv
 
 """
 Modules
@@ -33,11 +33,13 @@ class ParticleGNN(nn.Module):
     - 内部集約処理を GNN (GATConv) に置き換え、バッチを一括で処理
     """
     def __init__(self, embed_dim, n_head, attn_pdrop=0.0, resid_pdrop=0.0,
-                 att_type='hybrid', linear_bias=False):
+                 att_type='hybrid', linear_bias=False, gnn_type="gcn"):
         super().__init__()
         # embed_dim を n_head で割り切れる前提
         assert embed_dim % n_head == 0
         assert att_type in ['hybrid', 'cross', 'self']
+        assert gnn_type in ['gcn', 'gin', 'gat']
+        # print ("GNN Type: ", gnn_type)
 
         self.att_type = att_type
         self.n_head = n_head
@@ -54,18 +56,29 @@ class ParticleGNN(nn.Module):
             nn.ReLU()
         )
 
-        self.gnn = GCNConv(
-            in_channels=embed_dim,
-            out_channels=embed_dim,
-            bias=linear_bias
-        )
-        # self.gnn = GATConv(
-        #     in_channels=embed_dim,
-        #     out_channels=embed_dim // n_head,
-        #     heads=n_head,
-        #     dropout=attn_pdrop,       # 注意計算時のドロップアウト
-        #     bias=linear_bias          # バイアスを付けるか
-        # )
+        if gnn_type == 'gcn':
+            self.gnn = GCNConv(
+                in_channels=embed_dim,
+                out_channels=embed_dim,
+                bias=linear_bias
+            )
+        elif gnn_type == 'gin':
+            self.gnn = GINConv(
+                nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.ReLU(),
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.ReLU()
+                )
+            )
+        else:  # gnn_type == 'gat'
+            self.gnn = GATConv(
+                in_channels=embed_dim,
+                out_channels=embed_dim // n_head,
+                heads=n_head,
+                dropout=attn_pdrop,       # 注意計算時のドロップアウト
+                bias=linear_bias          # バイアスを付けるか
+            )
 
         # 出力投影 (residual用ドロップアウトを含む)
         self.proj = nn.Linear(embed_dim, embed_dim, bias=linear_bias)
@@ -253,7 +266,7 @@ class ParticleAttention(nn.Module):
 
 
 class EITBlock(nn.Module):
-    def __init__(self, embed_dim, h_dim, n_head, attn_pdrop=0.1, resid_pdrop=0.1, att_type='self'):
+    def __init__(self, embed_dim, h_dim, n_head, attn_pdrop=0.1, resid_pdrop=0.1, att_type='self', gnn_type="gcn"):
         super().__init__()
         self.att_type = att_type
 
@@ -262,8 +275,11 @@ class EITBlock(nn.Module):
         if self.att_type != 'self':
             self.ln_c = nn.LayerNorm(embed_dim)
 
-        # self.attn = ParticleAttention(embed_dim, n_head, attn_pdrop, resid_pdrop, att_type)
-        self.attn = ParticleGNN(embed_dim, n_head, attn_pdrop, resid_pdrop, att_type)
+        if gnn_type in ['gcn', 'gin', 'gat']:
+            # print("EITBlock GNN Type: ", gnn_type)
+            self.attn = ParticleGNN(embed_dim, n_head, attn_pdrop, resid_pdrop, att_type, gnn_type=gnn_type)
+        else:
+            self.attn = ParticleAttention(embed_dim, n_head, attn_pdrop, resid_pdrop, att_type)
 
         self.mlp = nn.Sequential(nn.Linear(embed_dim, h_dim),
                                  nn.ReLU(True),
@@ -352,6 +368,9 @@ class CustomTD3Policy(BasePolicy):
         self.critic_kwargs.update({"n_critics": n_critics})
         self.critic, self.critic_target = None, None
 
+        # print("Actor kwargs: ", self.actor_kwargs)
+        # print("Critic kwargs: ", self.critic_kwargs)
+
         # create networks and optimizers
         self._build(lr_schedule)
 
@@ -417,8 +436,10 @@ Entity Interaction Transformer Policy
 class EITActor(BasePolicy):
     def __init__(self, observation_space, action_space,
                  embed_dim=64, h_dim=128, n_head=1, dropout=0.0,
-                 masking=False, goal_cond=False, **kwargs):
+                 masking=False, goal_cond=False, gnn_type="gcn", **kwargs):
         super(EITActor, self).__init__(observation_space, action_space, squash_output=True)
+
+        # print("EIT Actor gnn_type: ", gnn_type)
 
         action_dim = get_action_dim(self.action_space)
         observation_shape = observation_space["achieved_goal"].shape
@@ -431,19 +452,19 @@ class EITActor(BasePolicy):
         particle_dim = particle_fdim - 1 if self.masking else particle_fdim
         self.particle_projection = nn.Linear(particle_dim, embed_dim)
         self.particle_self_att1 = EITBlock(embed_dim, h_dim, n_head,
-                                           attn_pdrop=dropout, resid_pdrop=dropout, att_type='self')
+                                           attn_pdrop=dropout, resid_pdrop=dropout, att_type='self', gnn_type=gnn_type)
 
         if self.goal_cond:
             self.goal_particle_projection = nn.Linear(particle_dim, embed_dim)
             self.particle_cross_att = EITBlock(embed_dim, h_dim, n_head,
-                                               attn_pdrop=dropout, resid_pdrop=dropout, att_type='cross')
+                                               attn_pdrop=dropout, resid_pdrop=dropout, att_type='cross', gnn_type=gnn_type)
 
         self.particle_self_att2 = EITBlock(embed_dim, h_dim, n_head,
-                                           attn_pdrop=dropout, resid_pdrop=dropout, att_type='self')
+                                           attn_pdrop=dropout, resid_pdrop=dropout, att_type='self', gnn_type=gnn_type)
 
 
         self.particle_pool_att = EITBlock(embed_dim, h_dim, n_head,
-                                          attn_pdrop=dropout, resid_pdrop=dropout, att_type='cross')
+                                          attn_pdrop=dropout, resid_pdrop=dropout, att_type='cross', gnn_type=gnn_type)
 
         self.ln = nn.LayerNorm(embed_dim)
         self.linear_out = nn.Linear(embed_dim, embed_dim, bias=True)
@@ -577,7 +598,7 @@ class EITActor(BasePolicy):
 class EITCriticNetwork(BaseModel):
     def __init__(self, observation_space, action_space,
                  embed_dim=64, h_dim=128, n_head=1, dropout=0.0,
-                 masking=False, goal_cond=False, action_particle=True):
+                 masking=False, goal_cond=False, action_particle=True, gnn_type="gcn"):
         super(EITCriticNetwork, self).__init__(observation_space, action_space)
 
         action_dim = get_action_dim(self.action_space)
@@ -588,6 +609,7 @@ class EITCriticNetwork(BaseModel):
         self.multiview = observation_shape[0] > 1 and len(observation_shape) == 3
         self.goal_cond = goal_cond
         self.action_particle = action_particle
+        self.gnn_type = gnn_type
 
         self.action_projection = nn.Sequential(nn.Linear(action_dim, h_dim),
                                                nn.ReLU(True),
@@ -596,18 +618,18 @@ class EITCriticNetwork(BaseModel):
         particle_dim = particle_fdim - 1 if self.masking else particle_fdim
         self.particle_projection = nn.Linear(particle_dim, embed_dim)
         self.particle_self_att1 = EITBlock(embed_dim, h_dim, n_head,
-                                           attn_pdrop=dropout, resid_pdrop=dropout, att_type='self')
+                                           attn_pdrop=dropout, resid_pdrop=dropout, att_type='self', gnn_type=gnn_type)
 
         if self.goal_cond:
             self.goal_particle_projection = nn.Linear(particle_dim, embed_dim)
             self.particle_cross_att = EITBlock(embed_dim, h_dim, n_head,
-                                               attn_pdrop=dropout, resid_pdrop=dropout, att_type='cross')
+                                               attn_pdrop=dropout, resid_pdrop=dropout, att_type='cross', gnn_type=gnn_type)
 
         self.particle_self_att2 = EITBlock(embed_dim, h_dim, n_head,
-                                           attn_pdrop=dropout, resid_pdrop=dropout, att_type='self')
+                                           attn_pdrop=dropout, resid_pdrop=dropout, att_type='self', gnn_type=gnn_type)
 
         self.particle_pool_att = EITBlock(embed_dim, h_dim, n_head,
-                                          attn_pdrop=dropout, resid_pdrop=dropout, att_type='cross')
+                                          attn_pdrop=dropout, resid_pdrop=dropout, att_type='cross', gnn_type=gnn_type)
 
         self.ln = nn.LayerNorm(embed_dim)
         self.linear_out = nn.Linear(embed_dim, embed_dim, bias=True)
@@ -718,7 +740,7 @@ class EITCriticNetwork(BaseModel):
 class EITCritic(BaseModel):
     def __init__(self, observation_space, action_space, n_critics=2, action_particle=True,
                  embed_dim=64, h_dim=256, n_head=1, dropout=0.0,
-                 masking=False, goal_cond=False, **kwargs):
+                 masking=False, goal_cond=False, gnn_type="gcn", **kwargs):
         super().__init__(observation_space, action_space)
 
         self.n_critics = n_critics
@@ -726,7 +748,7 @@ class EITCritic(BaseModel):
         for idx in range(n_critics):
             q_net = EITCriticNetwork(observation_space, action_space,
                                         embed_dim, h_dim, n_head, dropout,
-                                        masking, goal_cond, action_particle)
+                                        masking, goal_cond, action_particle, gnn_type)
             self.add_module(f"qf{idx}", q_net)
             self.q_networks.append(q_net)
 
